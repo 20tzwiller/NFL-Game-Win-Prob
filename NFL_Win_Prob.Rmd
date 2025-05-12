@@ -1,0 +1,840 @@
+---
+title: "NFL Machine Learning Project"
+author: "Thomas Zwiller"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+#importing nflfastR library
+library(nflfastR)
+#importing RSQLite (nflfastR is dependent on it)
+library(RSQLite)
+#importing DBI (nflfastR is dependent on it)
+library(DBI)
+#importing Random Forest for later use
+library(randomForest)
+#importing tidyr to help drop NA values
+library(tidyr)
+#importing caret to check predictions with a confusion matrix
+library(caret)
+#importing ggplot to make our plots
+library(ggplot2)
+#importing ggthemes to make themed plots
+library(ggthemes)
+```
+
+We used NFLFastR to import our data and then saved the raw data so we could import it each time we needed it moving forward instead of making an API call.
+
+```{r}
+NFL_Season_2020 <- readRDS(file = "/Users/TomTheIntern/Desktop/Mendoza/Mod 2/Maching Learning/Project/NFL Season Data/NFL_Season_2020.rds")
+
+NFL_Season_2021 <- readRDS(file = "/Users/TomTheIntern/Desktop/Mendoza/Mod 2/Maching Learning/Project/NFL Season Data/NFL_Season_2021.rds")
+
+NFL_Season_2022 <- readRDS(file = "/Users/TomTheIntern/Desktop/Mendoza/Mod 2/Maching Learning/Project/NFL Season Data/NFL_Season_2022.rds")
+
+NFL_Season_2023 <- readRDS(file = "/Users/TomTheIntern/Desktop/Mendoza/Mod 2/Maching Learning/Project/NFL Season Data/NFL_Season_2023.rds")
+
+#we also included the 2000 season for later testing
+NFL_Season_2000 <- load_pbp(seasons = 2000, file_type = "rds")
+```
+
+We then created our response variable, which was if the home team won or not.
+
+```{r}
+#We created our response variable by looking at the final score of each game
+NFL_Season_2020$home_win <- ifelse(NFL_Season_2020$home_score > NFL_Season_2020$away_score, 1, 0)
+NFL_Season_2021$home_win <- ifelse(NFL_Season_2021$home_score > NFL_Season_2021$away_score, 1, 0)
+NFL_Season_2022$home_win <- ifelse(NFL_Season_2022$home_score > NFL_Season_2022$away_score, 1, 0)
+NFL_Season_2023$home_win <- ifelse(NFL_Season_2023$home_score > NFL_Season_2023$away_score, 1, 0)
+NFL_Season_2000$home_win <- ifelse(NFL_Season_2000$home_score > NFL_Season_2000$away_score, 1, 0)
+
+#and saved the season data as a data frame
+NFL_Season_2020 <- as.data.frame(NFL_Season_2020)
+NFL_Season_2021 <- as.data.frame(NFL_Season_2021)
+NFL_Season_2022 <- as.data.frame(NFL_Season_2022)
+NFL_Season_2023 <- as.data.frame(NFL_Season_2023)
+NFL_Season_2000 <- as.data.frame(NFL_Season_2000)
+```
+
+
+Here we began to start cleaning our data by experimenting on the NFL_Season_2023 data set.
+
+Our first goal was to remove any categorical data columns that had more than 64 values. The play-by-play data included categories such as the name of the player making the play and a brief description of the play. Because of this, we had to eliminate the columns or risk overwhelming any algorithm we tried to utilize. 
+
+We kept factors with 64 or fewer to include the name of each team and whether they were at home or on the road. We eliminated any factors with only one level.
+
+We also wanted to include all the numeric values, like seconds remaining in the half or quarter, which would have been removed if we didn't specifically apply the filter to factor variables. 
+
+We also realized that we needed to remove any plays that were "untimed downs", mainly kickoffs and PATs, as the vast majority of those observations contained numerous NA's that made them nearly impossible to include in the model. 
+
+```{r}
+vals <- rep(NA, ncol(NFL_Season_2023))
+
+for(i in 1:ncol(NFL_Season_2023)){
+  vals[i] <- length(unique(NFL_Season_2023[,i]))
+}
+
+vals
+names(NFL_Season_2023)[vals <= 1]
+
+
+#this returns factors that are less than or equal to 64 but greater than 1
+nfl_factors <- NFL_Season_2023[,which(vals <= 64 & vals > 1 & sapply(NFL_Season_2023, is.factor))]
+
+#this returns just the numeric values
+nfl_nums <- NFL_Season_2023[ , sapply(NFL_Season_2023, is.numeric)]
+
+#this binds the two frames together into our usable data
+nfl_use <- cbind(nfl_nums, nfl_factors)
+```
+
+<br>
+With cleaned data, we decided to determine key variables. Based on our research, we first checked pre-game Vegas lines.
+<br>
+
+```{r}
+vegas_spread <- ggplot(NFL_Season_2023, aes(x = spread_line,
+                          fill = as.factor(home_win))) + # Set fill as region variable
+  geom_density() + # Use geom_density to get density plot
+  geom_density(alpha = 0.5) + 
+  theme_stata() + # Set theme for plot 
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(x = "Pre-Game Vegas Line", # Set plot labels
+       title = "Density Plot of Vegas Pre-Game Lines vs Result",
+       fill = "Win or Loss") +
+  scale_fill_manual(
+    values = c("1" = "red", "0" = "blue"),
+    labels = c("1" = "Win", "0" = "Loss"))
+
+vegas_spread # Generate plot
+```
+
+Initially the result might seem counter-intuitive, but the PBP data actually records the number of points favored by as a positive number, while the underdog is associated with a negative value. This is the inverse of how Vegas records its lines.
+
+It's easy to see that generally, teams who are favored were likely to win their game, but it wasn't always the rule. 
+
+<br>
+
+We also decided to look at the home team score to see if there was a point threshold where the home team became more likely to win.
+
+```{r}
+home_team_score <- ggplot(NFL_Season_2023, aes(x = total_home_score,
+                          fill = as.factor(home_win))) + # Set fill as region variable
+  geom_density() + # Use geom_density to get density plot
+  geom_density(alpha = 0.5) + 
+  theme_stata() + # Set theme for plot 
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(x = "Home Team Points Scored", # Set plot labels
+       title = "Density Plot of Home Team Score vs Result",
+       fill = "Win or Loss") +
+  scale_fill_manual(
+    values = c("1" = "red", "0" = "blue"),
+    labels = c("1" = "Win", "0" = "Loss"))
+
+home_team_score
+```
+
+<br>
+
+By looking at the plot, it appears that teams who score 15 or fewer points are more likely to lose a given NFL game. However, teams become much more likely to win when they score 16 points or more.
+
+In the NFL, teams tend to score fewer than 40 points, but those who do are much more likely to win.
+
+Finally, we decided to look at touchdown probability for a given drive relative to field position.
+
+```{r}
+# Ensure 'yardline_100' and 'td_prob' are numeric
+nfl_use$yardline_100 <- as.numeric(nfl_use$yardline_100)
+nfl_use$td_prob <- as.factor(ifelse(nfl_use$td_prob > 0.5, "1", "0")) 
+
+# Remove rows with missing values
+nfl_use_cleaned <- nfl_use[!is.na(nfl_use$yardline_100) & !is.na(nfl_use$td_prob), ]
+
+# Generate Density Plot
+td_prob <- ggplot(nfl_use_cleaned, aes(x = yardline_100, fill = td_prob)) +
+  geom_density(alpha = 0.5) +
+  theme_stata() + # Simplify theme setup
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()) +
+  labs(
+    x = "Yardline (Field Position)",
+    title = "Yardline - Touchdown Probability",
+    fill = "Touchdown Probability") +
+  scale_fill_manual(
+    values = c("1" = "red", "0" = "blue"),
+    labels = c("1" = "High TD Probability", "0" = "Low TD Probability"))
+
+# Display the plot
+td_prob
+```
+<br>
+
+Based on the graph, we see that there is a low touchdown probability around the 75 yard yard line (the teams own 25). However, once teams get past the 70 (their own 30) the probability begins to decrease before becoming more likely at the opponents 30 yard line. There is a slight dip around the opponents 5 yard line, which likely indicates that teams who get that close to the goal line are more likely to kick a field goal.
+
+<br>
+
+
+```{r}
+nfl_use <- drop_na(nfl_use, posteam)
+nfl_use <- drop_na(nfl_use, down)
+```
+
+So with out data cleaned and prepared for the analysis, we created our first model, a logistic regression model that accounted for:
+
+The team with the ball
+The team who was at home
+The scoring margin at the time of the play
+The number of seconds remaining in the half
+The number of seconds remaining in the game
+The down of the play
+The yards to go after the play
+Where the ball was on the field
+The number of timeouts for the team with the ball
+The number of timeouts for the team on defense
+The Vegas spread going into the game
+
+We made the model family binomial to reflect that the outcomes are binary, and trained the model on predicting the chances of the home team winning. 
+
+```{r}
+win_model_1.0 <- glm(home_win ~ posteam + home_team + score_differential +
+                       half_seconds_remaining + game_seconds_remaining + down
+                     + ydstogo + yardline_100 + posteam_timeouts_remaining +
+                       defteam_timeouts_remaining + 
+                       spread_line
+                     , data = NFL_Season_2023, family = "binomial")
+
+win_model_1.1 <- glm(home_win ~ posteam + home_team + score_differential +
+                       half_seconds_remaining+ posteam_timeouts_remaining +
+                       defteam_timeouts_remaining + 
+                       spread_line
+                     , data = NFL_Season_2023, family = "binomial")
+
+summary(win_model_1.1)
+```
+
+
+Based on the initial results, which team has the ball and at home was generally considered to be statistically significant. This makes sense, as in the one season we examined, some teams finished with a losing record while others finished with a winning record. This does mean that the model will be incredibly biased towards teams if we were to deploy it, so we need to include multiple years of data, and likely update it after each week of the regular season. 
+
+game_seconds_remaining was less significant than half_seconds_remaining, so we may need to consider removing game_seconds remaining and only use half_seconds remaining
+
+The down was considered to be insignificant, and may need to be removed. 
+
+Both timeouts for the team on offense and the team on defense was highly significant. 
+
+The spread_line (the Vegas spread) was highly significant. 
+
+The down and field position (yardline_100) were considered insignificant and might be removed when we add in the other data sets down the road.
+
+The AIC of the model was 46,511, which seems high but we have 32 variables for the posteam variable and another 32 for the home team, which are making that figure rather large. Earlier iterations of the model had an AIC of 50,000+.
+
+<br>
+
+Now we can try training the model and then testing it.
+
+```{r}
+set.seed(111111)
+#getting the number of observations
+num_obs <- nrow(nfl_use)
+#getting a random set of rows for training data
+train_data_rows <- sample(1:num_obs, 0.80*num_obs)
+#creating testing data
+train_data <- nfl_use[train_data_rows , ]
+#using the remaining rows for testing data
+test_data <- nfl_use[-train_data_rows , ]
+```
+
+Let's re-train the model on the training set. 
+
+```{r}
+win_model_1.0.1 <- glm(home_win ~ posteam + home_team + score_differential +
+                       half_seconds_remaining + game_seconds_remaining + down
+                     + ydstogo + yardline_100 + posteam_timeouts_remaining +
+                       defteam_timeouts_remaining + 
+                       spread_line
+                     , data = train_data, family = "binomial")
+
+
+```
+
+And then test the model using the unseen data.
+
+```{r}
+#Making predictions
+pred_1 <- predict(win_model_1.1, newdata = test_data)
+#converting them out of log and into normalized %s
+pred_1 <- 1 / (1 + exp(-pred_1))
+#converting to wins if above 50%
+pred_1 <- ifelse(pred_1 >= 0.5, 1, 0)
+
+pred_1 <- as.factor(pred_1)
+
+pred_1 <- unname(pred_1)
+
+test_data$home_win <- as.factor(test_data$home_win)
+
+confusionMatrix(test_data$home_win, pred_1, positive = "1")
+```
+
+Our initial model had an accuracy of 71.07%, but struggled to pick games in which team actually wound up winning, suggesting the model struggles with teams who are able to complete a comeback victory. 
+
+After experimenting with a simple logistic regression model, we decided to see if we could gain any additional insight from using a RandomForest model. This did mean that we needed to clean our data a little bit differently because we could now try and use different predictor variables.
+
+
+```{r}
+#setting the seed for repeat-ability
+set.seed(111111)
+
+#binding all four of the NFL seasons
+total_data <- rbind(NFL_Season_2020, NFL_Season_2021, NFL_Season_2022, NFL_Season_2023, NFL_Season_2000)
+
+#setting any NA data points into unknowns
+total_data[is.na(total_data)] <- "unknown"
+
+total_data[] <- lapply(total_data, function(col) {
+  if (!is.numeric(col) & !is.integer(col)) {
+    col <- factor(col)
+  }
+  return(col)
+})
+
+for(i in 1:ncol(total_data)){
+  vals[i] <- length(unique(total_data[,i]))
+}
+
+vals
+high_drop_names <- names(total_data)[vals >= 33]
+
+low_drop_names <- names(total_data)[vals < 3]
+
+# Drop the specified columns from the dataset
+cleaned_data <- total_data[, !(colnames(total_data) %in% high_drop_names)]
+
+cleaned_data <- cleaned_data[, !(colnames(cleaned_data) %in% low_drop_names)]
+
+cleaned_data$home_win <- as.factor(ifelse(total_data$home_score > total_data$away_score, 1, 0))
+
+cleaned_data$home_score <- total_data$home_score
+cleaned_data$away_score <- total_data$away_score
+cleaned_data$game_seconds_remaining <- as.numeric(total_data$game_seconds_remaining)
+cleaned_data$spread_line <- total_data$spread_line
+cleaned_data$old_game_id <- as.numeric(total_data$old_game_id)
+cleaned_data$yardline_100 <- as.numeric(total_data$yardline_100)
+cleaned_data$total_home_score <- as.numeric(total_data$total_home_score) 
+cleaned_data$total_away_score <- as.numeric(total_data$total_away_score)
+cleaned_data$half_seconds_remaining <- as.numeric(total_data$half_seconds_remaining)
+
+# Define the columns to drop
+drop_column_names <- c("lateral_receiving_yards", 
+          "lateral_rusher_player_id", 
+          "lateral_rusher_player_name", 
+          "lateral_interception_player_id", 
+          "lateral_interception_player_name", 
+          "lateral_punter_returner_player_id", 
+          "lateral_punt_returner_player_name",
+          "home_score",
+          "away_score")
+
+# Remove the specified columns from cleaned_data
+cleaned_data <- cleaned_data[, !(names(cleaned_data) %in% drop_column_names)]
+
+```
+
+Let's try training the random forest model, and then making predictions.
+
+
+```{r eval = FALSE}
+set.seed(111111)
+#getting the number of observations
+num_obs <- nrow(cleaned_data)
+#getting a random set of rows for training data
+train_data_rows <- sample(1:num_obs, 0.50*num_obs)
+#creating testing data
+train_data <- cleaned_data[train_data_rows , ]
+#using the remaining rows for testing data
+test_data <- cleaned_data[-train_data_rows , ]
+
+win_tree_model <- randomForest(home_win ~ . , 
+                               data = train_data, 
+                               mtry = floor(ncol(train_data) * 0.333),
+                               ntree = 200,
+                               nodesize = 5,
+                               progress = TRUE)
+
+#Making predictions
+pred_1 <- predict(win_tree_model, newdata = test_data, type = "prob")
+
+#converting to wins if above 50%
+pred_1 <- as.factor(ifelse(pred_1[, 2] >= 0.5, 1, 0))
+confusionMatrix(test_data$home_win, pred_1, positive = "1")
+```
+
+
+Two things are happening here. One, we are over fitting our data by limiting the node size to 5 when we are training on nearly 80k plays. We also used 200 trees. As a result, the model was able to predict every single instance correctly. Not good. 
+
+We tried to correct this with our next model, but issue number two, which was much less obvious, was still a huge problem. That will be explained after the next chunk.
+
+
+```{r}
+#first, we set up a new data frame to serve as the basis for the next model.
+cleaned_data_2 <- cleaned_data
+
+#and dropped any columns that had little to no statistical significance. 
+drop_column_names_2 <- c(
+  "qb_dropback",
+  "field_goal_result",
+  "first_down_rush",
+  "first_down_penalty",
+  "third_down_failed",
+  "fourth_down_failed",
+  "punt_in_endzone",
+  "punt_out_of_bounds",
+  "punt_downed",
+  "solo_tackle",
+  "lateral_reception",
+  "lateral_return",
+  "lateral_recovery",
+  "forced_fumble_player_2_team",
+  "forced_fumble_player_2_player_id",
+  "forced_fumble_player_2_player_name",
+  "tackle_with_assist",
+  "fumbled_2_team",
+  "fumble_recovery_2_yards",
+  "lateral_rushing_yards",
+  "fumble_recovery_2_player_id",
+  "lateral_punt_returner_player_id"
+)
+
+
+
+#we then filtered the names out
+cleaned_data_2 <- cleaned_data_2[, !(names(cleaned_data_2) %in% drop_column_names_2)]
+
+#creating testing data
+train_data <- cleaned_data_2[train_data_rows , ]
+#using the remaining rows for testing data
+test_data <- cleaned_data_2[-train_data_rows , ]
+
+win_tree_model_2 <- randomForest(home_win ~ . , 
+                              data = train_data, 
+                              mtry = sqrt(ncol(train_data)),
+                              ntree = 100,
+                              nodesize = 250,
+                              progress = TRUE)
+
+pred_2 <- predict(win_tree_model_2, newdata = test_data, type = "prob")
+#converting to wins if above 50%
+pred_2 <- as.factor(ifelse(pred_2[, 2] >= 0.5, 1, 0))
+
+confusionMatrix(test_data$home_win, pred_2, positive = "1")
+```
+
+
+Despite our best efforts to guard against over fitting, the model was still over fitting, by a lot. This is where realization number two happened. 
+
+We realized that because we were asking the model to make game predictions and then feeding it individual pieces from each game, we essentially gave the model the answers and asked it to repeat them back to us. 
+
+The problem wasn't that we were conducting random samples, it was the way in which we pulled those samples. We needed to give the model whole games and then test it on unseen whole games as opposed to giving it portions of each game and then giving it unseen portions from the same game.
+
+The difference is essentially the same as if I gave you pages out of a book and asked you to predict how the last chapter finished. You would be able to tell me major plot points from the book you were reading, as well as themes and character names, which would be helpful and you might get some things right. 
+
+However, this is like me giving you random pages from a book and then asking you to tell me how Chapter 7 started and ended. You might not have the exact pages that the chapter began and finished on, but you had pages from THAT chapter, as well as pages before the chapter (so you should know how it would begin) and pages after the chapter (so you should know how it would end). 
+
+We realized that the model was able to learn how to make predictions based off of the match-up than the actual game situation, so we needed to train it on the first two seasons (2020 and 2021) and then test it on the next two unseen seasons (2022 and 2023). 
+Like in the book example, some things would carry over, like the Chiefs being a good football team, the Jets being rather poor, etc. But, while the match-ups would include the same teams, it wouldn't include an identical result, and the model would have to learn to go off of game situation rather than just the two teams.
+
+
+```{r}
+#this was our final removal of columns that had little predictive power
+cleaned_final_names <- c(
+"punt_blocked",                       
+"first_down_pass",                 
+"third_down_converted",            
+"fourth_down_converted",            
+"incomplete_pass",                
+"interception",                
+"punt_inside_twenty",            
+"fumble_forced",            
+"fumble_out_of_bounds",          
+"safety",                 
+"penalty",                  
+"fumble_lost",                 
+"qb_hit",                
+"pass_attempt",               
+"return_touchdown",              
+"field_goal_attempt",             
+"punt_attempt",            
+"fumble",                             
+"complete_pass",                      
+"assist_tackle",                      
+"lateral_rush",                       
+"fumble_recovery_2_team",             
+"fumble_recovery_2_player_name",      
+"replay_or_challenge_result",
+"lateral_kickoff_returner_player_id",
+"lateral_kickoff_returner_player_name",
+"defensive_two_point_conv",
+"old_game_id",
+"kickoff_downed",                        
+"kickoff_fair_catch",
+"own_kickoff_recovery_player_id",       
+"own_kickoff_recovery_player_name",    
+"defensive_two_point_attempt",          
+"own_kickoff_recovery",
+"xyac_median_yardage",
+"down",
+"punt_fair_catch",
+"kickoff_in_endzone",
+"tackled_for_loss",
+"success",
+"play_type_nfl",
+"series_result",
+"fumble_not_forced",
+"kickoff_out_of_bounds",
+"timeout",
+"extro_point_prob",
+"defteam_timeouts_remaining",
+"run_gap",
+"game_half",
+"play_type",
+"drive_inside20",
+"drive_ended_with_score",
+"drive_quarter_start",
+"drive_start_transition",
+"kickoff_inside_twenty", 
+"first_down", 
+"pass_touchdown", 
+"rush_touchdown", 
+"sack", 
+"extra_point_attempt", 
+"two_point_attempt",
+"touchdown",
+"extra_point_prob",
+"extra_point_result",
+"kickoff_attempt",
+"two_point_conv_result",
+"rush_attempt",
+"run_location",
+"ydstogo",
+"drive_play_count",
+"fixed_drive_result",
+"drive_first_downs",
+"drive_quarter_end",
+"drive_end_transition"
+)
+
+cleaned_final <- cleaned_data_2[, !(names(cleaned_data_2) %in% cleaned_final_names)]
+```
+
+This is where the magic happens. We partitioned our data along seasons instead of doing so randomly, meaning that the data we were testing our model was unseen at a game level, not just a play level.
+
+
+```{r}
+#training data
+NFL_2020_NFL_2021 <- cleaned_final[cleaned_final$season == 2020 | 
+                                    cleaned_final$season == 2021 | cleaned_final$season == 2000, ]
+
+#testing data
+NFL_2022_NFL_2023 <- cleaned_final[cleaned_final$season == 2022 | 
+                                    cleaned_final$season == 2023,]
+
+#2000 Season Testing Data
+NFL_2000_Test <- cleaned_final[cleaned_final$season == 2000 , ]
+
+```
+
+Now we could begin trying to train a few different models with different parameters.
+
+Our first was just a general model, guarded against over fitting.
+
+```{r}
+Test_Try <- randomForest(home_win ~ ., 
+                              data = NFL_2020_NFL_2021, 
+                              mtry = ncol(NFL_2020_NFL_2021) * .333,
+                              ntree = 150,
+                              nodesize = 750,
+                              progress = TRUE)
+
+Test_Try$importance
+```
+
+This version removed the season and then the week.
+
+```{r}
+#the chosen one
+NFL2020_NFL2021_Tree <- randomForest(home_win ~ . -season -week, 
+                              data = NFL_2020_NFL_2021, 
+                              mtry = sqrt(ncol(NFL_2020_NFL_2021)),
+                              ntree = 150,
+                              nodesize = 1000,
+                              maxnodes = 60)
+
+NFL2020_NFL2021_Tree$importance
+```
+
+One thing re realized is that while the home team and the away team were incredibly strong predictors, this likely created bias within the model. When we tested the current iteration against the 2000 season, the model's performance dropped off rather significantly.
+
+So we tried a model that did not include the home and away teams, making it focus more on the on the field product, but also included the spread which served as a control for opponent quality.
+
+
+```{r}
+set.seed(111111)
+#no home or away team present
+no_team_model <- randomForest(home_win ~ . -season -week 
+                              -home_team -away_team 
+                              -wind -goal_to_go -pass_length 
+                              -pass_location, 
+                              data = NFL_2020_NFL_2021, 
+                              mtry = sqrt(ncol(NFL_2020_NFL_2021)),
+                              ntree = 150,
+                              nodesize = 2000,
+                              maxnodes = 90)
+
+no_team_model$importance
+
+importance_df <- as.data.frame(no_team_model$importance)
+
+importance_df$Variable <- rownames(importance_df)
+
+ggplot(importance_df, aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() +
+  labs(title = "Variable Importance (Random Forest)",
+       x = "Variables",
+       y = "Mean Decrease in Gini") +
+  theme_minimal()
+
+```
+
+Now with a version of the model we can trust, we can start making predictions and grading the models performance.
+
+
+```{r}
+pred_3 <- predict(no_team_model, newdata = NFL_2022_NFL_2023, type = "prob")
+
+#converting to wins if above 50%
+pred_3_fact <- as.factor(ifelse(pred_3[, 2] >= 0.5, 1, 0))
+
+confusionMatrix(NFL_2022_NFL_2023$home_win, pred_3_fact, positive = "1")
+
+
+pred_3_confusion <- confusionMatrix(NFL_2022_NFL_2023$home_win, pred_3_fact, positive = "1")
+
+pred_3_table <- as.data.frame(pred_3_confusion$table)
+
+ggplot(pred_3_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  #setting our tile coloring
+  geom_tile(color = "white") + 
+  #setting the color and size of the text
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  #setting the color of our gradient
+  scale_fill_gradient(low = "gray", high = "red") +
+  #adding in labels
+  labs(title = "No-Teams Model Predicting 2022-23 NFL Seasons", x = "Actual", y = "Predicted") +
+  #plus our theme
+  theme_minimal()
+```
+
+We then looked at the distribution of the %'s for a given win prediction.
+
+```{r}
+library(ggplot2)
+
+#Converting to a data frame
+pred_df <- data.frame(class_0 = pred_3[, 1], class_1 = pred_3[, 2])
+
+#And then plotting a historgram of the win predictions
+ggplot(pred_df, aes(x = class_1)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.5) +
+  labs(title = "Distribution of Win Predictions", x = "% Chance of Win", y = "Frequency") +
+  theme_stata()
+
+```
+We also decided to test on a few specific games just to see how the model measured up against ESPN's FPI. The first was Denver at Detroit in 2023.
+
+```{r}
+game_test <- NFL_2022_NFL_2023[NFL_2022_NFL_2023$home_team == "DET" & NFL_2022_NFL_2023$away_team == "DEN" & NFL_2022_NFL_2023$season == 2023, ]
+
+game_test_pred <- predict(no_team_model, newdata = game_test, type = "prob")
+
+# Assuming game_pred_list is a list of predictions
+game_pred_df <- data.frame(game_pred = unlist(game_test_pred))  # Convert list to data frame
+
+# Plotting the predictions
+ggplot(data = game_pred_df, aes(x = seq_along(game_pred.1), y = game_pred.1)) + 
+  geom_line() +
+  labs(x = "Play Number", y = "Winning %", title = "Home Team's Chance of Winning") +
+  theme_stata() +
+  theme(panel.grid = element_blank())
+```
+
+The next was Chicago at Detroit.
+
+```{r}
+game_test <- NFL_2022_NFL_2023[NFL_2022_NFL_2023$home_team == "DET" & NFL_2022_NFL_2023$away_team == "CHI" & NFL_2022_NFL_2023$season == 2023, ]
+
+game_test_pred <- predict(no_team_model, newdata = game_test, type = "prob")
+
+# Assuming game_pred_list is a list of predictions
+game_pred_df <- data.frame(game_pred = unlist(game_test_pred))  # Convert list to data frame
+
+# Plotting the predictions
+ggplot(data = game_pred_df, aes(x = seq_along(game_pred.1), y = game_pred.1)) + 
+  geom_line() +
+  labs(x = "Play Number", y = "Winning %", title = "Home Team's Chance of Winning") +
+  theme_stata() +
+  theme(panel.grid = element_blank())
+```
+
+And finally the Bills at Philly.
+
+```{r}
+game_test <- NFL_2022_NFL_2023[NFL_2022_NFL_2023$home_team == "PHI" & NFL_2022_NFL_2023$away_team == "BUF" & NFL_2022_NFL_2023$season == 2023, ]
+
+game_test_pred <- predict(no_team_model, newdata = game_test, type = "prob")
+
+# Assuming game_pred_list is a list of predictions
+game_pred_df <- data.frame(game_pred = unlist(game_test_pred))  # Convert list to data frame
+
+# Plotting the predictions
+ggplot(data = game_pred_df, aes(x = seq_along(game_pred.1), y = game_pred.1)) + 
+  geom_line() +
+  labs(x = "Play Number", y = "Winning %", title = "Home Team's Chance of Winning") +
+  theme_stata() +
+  theme(panel.grid = element_blank())
+```
+
+And then we tried to train a model based off of historical data and then apply it to more modern seasons.
+
+
+
+```{r}
+NFL2000_Tree <- randomForest(home_win ~ . -season -week 
+                              -home_team -away_team -goal_to_go
+                              -pass_length, 
+                              data = NFL_2000_Test, 
+                              mtry = sqrt(ncol(NFL_2000_Test)),
+                              ntree = 150,
+                              nodesize = 1000,
+                              maxnodes = 60)
+
+pred_2000_teams <- predict(NFL2000_Tree, newdata = NFL_2022_NFL_2023, type = "prob")
+
+#converting to wins if above 50%
+pred_2000_fact <- as.factor(ifelse(pred_2000_teams[, 2] >= 0.5, 1, 0))
+
+confusionMatrix(NFL_2022_NFL_2023$home_win, pred_2000_fact, positive = "1")
+
+pred_2000_noteam <- confusionMatrix(NFL_2022_NFL_2023$home_win, pred_2000_fact, positive = "1")
+
+pred_2000_noteam_table <- as.data.frame(pred_2000_noteam$table) 
+
+ggplot(pred_2000_noteam_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  #setting our tile coloring
+  geom_tile(color = "white") + 
+  #setting the color and size of the text
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  #setting the color of our gradient
+  scale_fill_gradient(low = "gray", high = "red") +
+  #adding in labels
+  labs(title = "No-Teams Model Predicting 2022-23 NFL Seasons", x = "Actual", y = "Predicted") +
+  #plus our theme
+  theme_minimal()
+```
+
+In general, the model performed a little more poorly than the previous versions, suggesting that the model needs more recent data to make predictions, but that it is still flexible enough to make solid predictions when it can only use old data.
+
+In addition, the model became much more consistent and accurate when it had access to three or more seasons, suggesting that more seasons would likely improve the model.
+
+```{r}
+modern_stats <- cleaned_final[
+  cleaned_final$season == 2020|
+  cleaned_final$season == 2021|
+  cleaned_final$season == 2022|
+  cleaned_final$season == 2023 ,
+]
+
+no_team_modern <- randomForest(home_win ~ . -season -week 
+                              -home_team -away_team 
+                              -wind -goal_to_go -pass_length -pass_location -roof - surface - special_teams_play, 
+                              data = modern_stats, 
+                              mtry = sqrt(ncol(modern_stats)),
+                              ntree = 150,
+                              nodesize = 2000,
+                              maxnodes = 90)
+
+pred_mod <- predict(no_team_modern, newdata = NFL_2000_Test, type = "prob")
+
+#converting to wins if above 50%
+pred_mod_fact <- as.factor(ifelse(pred_mod[, 2] >= 0.5, 1, 0))
+
+confusionMatrix(NFL_2000_Test$home_win, pred_mod_fact, positive = "1")
+
+pred_mod_confusion <- confusionMatrix(NFL_2000_Test$home_win, pred_mod_fact, positive = "1")
+
+pred_mod_table <- as.data.frame(pred_mod_confusion$table)
+
+ggplot(pred_mod_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  #setting our tile coloring
+  geom_tile(color = "white") + 
+  #setting the color and size of the text
+  geom_text(aes(label = Freq), color = "black", size = 5) +
+  #setting the color of our gradient
+  scale_fill_gradient(low = "gray", high = "red") +
+  #adding in labels
+  labs(title = "No-Teams Model Predicting 2000 NFL Season", x = "Actual", y = "Predicted") +
+  #plus our theme
+  theme_minimal()
+
+```
+
+The no-team modern model was able to improve it's accuracy to over 75%, which shows that including more seasons is incredibly beneficial to the model.
+
+
+```{r}
+no_team_modern$importance
+
+importance_modern <- as.data.frame(no_team_modern$importance)
+
+importance_modern$Variable <- rownames(importance_modern)
+
+ggplot(importance_modern, aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() +
+  labs(title = "Variable Importance (Random Forest)",
+       x = "Variables",
+       y = "Mean Decrease in Gini") +
+  theme_minimal()
+```
+```{r}
+#Converting to a data frame
+pred_mod <- data.frame(class_0 = pred_mod[, 1], class_1 = pred_mod[, 2])
+
+#And then plotting a historgram of the win predictions
+ggplot(pred_mod, aes(x = class_1)) +
+  geom_histogram(binwidth = 0.05, alpha = 0.5) +
+  labs(title = "Distribution of Win Predictions", x = "% Chance of Win", y = "Frequency") +
+  theme_stata()
+```
+
+
+<br>
+<br>
+<br>
+<br>
+
+
+
